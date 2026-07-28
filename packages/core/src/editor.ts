@@ -1,4 +1,4 @@
-import { Annotation, EditorSelection, EditorState } from "@codemirror/state";
+import { Annotation, EditorSelection, EditorState, type TransactionSpec } from "@codemirror/state";
 
 // Annotation attached to dispatches that load content programmatically (e.g.
 // setDocument from file open) so updateListener can skip the user-edit path —
@@ -284,6 +284,7 @@ export function createEditor(config: EditorConfig): EditorAPI {
   let destroyed = false;
   let destroying = false;
   let focused = false;
+  let transacting = false;
   let parseTimer: ReturnType<typeof setTimeout> | undefined;
   let compositionFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingCompositionMarkdown: string | null = null;
@@ -920,6 +921,89 @@ export function createEditor(config: EditorConfig): EditorAPI {
       const words = doc.trim() === "" ? 0 : doc.trim().split(/\s+/).length;
       const lines = view.state.doc.lines;
       return { characters, words, lines };
+    },
+    transact(fn: () => void): void {
+      if (destroyed) return;
+      if (transacting) {
+        throw new Error("Nested transactions are not supported");
+      }
+
+      transacting = true;
+      const originalDispatch = view.dispatch.bind(view);
+      const specs: TransactionSpec[] = [];
+
+      view.dispatch = ((spec: TransactionSpec): void => {
+        specs.push(spec);
+      }) as unknown as typeof view.dispatch;
+
+      try {
+        fn();
+      } catch (e) {
+        transacting = false;
+        view.dispatch = originalDispatch;
+        throw e;
+      }
+
+      transacting = false;
+      view.dispatch = originalDispatch;
+
+      if (specs.length === 0) return;
+
+      // Replay every collected spec against the original document string to
+      // compute the net result. All mutators (replaceSelection, replaceRange,
+      // setDocument) compute their change relative to the current view.state,
+      // which is frozen during transact (dispatch is intercepted). We apply
+      // each change spec to a string buffer and track the last selection,
+      // then emit a single full-document replacement for exactly one undo entry.
+      let doc = view.state.doc.toString();
+      let finalSelection: { anchor: number; head: number } | undefined = undefined;
+      let needsScroll = false;
+
+      for (const spec of specs) {
+        if (spec.changes) {
+          const changeList = Array.isArray(spec.changes) ? spec.changes : [spec.changes];
+          for (const c of changeList) {
+            if (c && typeof c === "object" && "from" in c) {
+              const ch = c as { from: number; to?: number; insert?: string };
+              const from = ch.from;
+              const to = ch.to ?? from;
+              const insert = ch.insert ?? "";
+              doc = doc.slice(0, from) + insert + doc.slice(to);
+            }
+            // Silently skip non-plain ChangeSpec instances (ChangeSet, etc.).
+            // All EditorAPI methods produce the plain {from,to,insert} form
+            // so this is safe in practice.
+          }
+        }
+        if (spec.selection) {
+          if ("ranges" in spec.selection) {
+            // EditorSelection object
+            finalSelection = {
+              anchor: spec.selection.main.anchor,
+              head: spec.selection.main.head,
+            };
+          } else {
+            // { anchor, head? }
+            finalSelection = {
+              anchor: spec.selection.anchor,
+              head: spec.selection.head ?? spec.selection.anchor,
+            };
+          }
+        }
+        if (spec.scrollIntoView) needsScroll = true;
+      }
+
+      originalDispatch({
+        changes: {
+          from: 0,
+          to: view.state.doc.length,
+          insert: doc,
+        },
+        selection: finalSelection
+          ? { anchor: finalSelection.anchor, head: finalSelection.head }
+          : undefined,
+        scrollIntoView: needsScroll,
+      });
     },
     destroy() {
       if (destroyed || destroying) return;
