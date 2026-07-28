@@ -949,56 +949,38 @@ export function createEditor(config: EditorConfig): EditorAPI {
 
       if (specs.length === 0) return;
 
-      // Replay every collected spec against the original document string to
-      // compute the net result. All mutators (replaceSelection, replaceRange,
-      // setDocument) compute their change relative to the current view.state,
-      // which is frozen during transact (dispatch is intercepted). We apply
-      // each change spec to a string buffer and track the last selection,
-      // then emit a single full-document replacement for exactly one undo entry.
+      // All specs are relative to the original view.state, which was frozen
+      // during the callback (dispatch was intercepted). Because later specs'
+      // positions are NOT relative to earlier specs' results, we replay them
+      // sequentially against a string buffer and emit a single full-document
+      // replacement → exactly one undo entry.
       let doc = view.state.doc.toString();
-      let finalSelection: { anchor: number; head: number } | undefined = undefined;
+      let finalSelection: { anchor: number; head: number } | undefined;
       let needsScroll = false;
 
       for (const spec of specs) {
         if (spec.changes) {
-          const changeList = Array.isArray(spec.changes) ? spec.changes : [spec.changes];
+          const changeList = Array.isArray(spec.changes)
+            ? spec.changes
+            : [spec.changes];
           for (const c of changeList) {
             if (c && typeof c === "object" && "from" in c) {
               const ch = c as { from: number; to?: number; insert?: string };
-              const from = ch.from;
-              const to = ch.to ?? from;
-              const insert = ch.insert ?? "";
-              doc = doc.slice(0, from) + insert + doc.slice(to);
+              const to = ch.to ?? ch.from;
+              doc = doc.slice(0, ch.from) + (ch.insert ?? "") + doc.slice(to);
             }
-            // Silently skip non-plain ChangeSpec instances (ChangeSet, etc.).
-            // All EditorAPI methods produce the plain {from,to,insert} form
-            // so this is safe in practice.
           }
         }
         if (spec.selection) {
-          if ("ranges" in spec.selection) {
-            // EditorSelection object
-            finalSelection = {
-              anchor: spec.selection.main.anchor,
-              head: spec.selection.main.head,
-            };
-          } else {
-            // { anchor, head? }
-            finalSelection = {
-              anchor: spec.selection.anchor,
-              head: spec.selection.head ?? spec.selection.anchor,
-            };
-          }
+          finalSelection = "ranges" in spec.selection
+            ? { anchor: spec.selection.main.anchor, head: spec.selection.main.head }
+            : { anchor: spec.selection.anchor, head: spec.selection.head ?? spec.selection.anchor };
         }
         if (spec.scrollIntoView) needsScroll = true;
       }
 
       originalDispatch({
-        changes: {
-          from: 0,
-          to: view.state.doc.length,
-          insert: doc,
-        },
+        changes: { from: 0, to: view.state.doc.length, insert: doc },
         selection: finalSelection
           ? { anchor: finalSelection.anchor, head: finalSelection.head }
           : undefined,
